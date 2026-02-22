@@ -15,6 +15,7 @@ num_cpus = "1"
 anyhow = "1"
 rand = "0.9"
 wasmtime = "31"
+windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [features]
 cuda = []

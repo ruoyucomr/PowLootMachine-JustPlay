@@ -963,9 +963,13 @@ fn mine_worker(
             let prog_bytes = hex::decode(&program_hex).expect("bad program_hex");
             let ch_bytes = challenge.as_bytes();
             let seed_bytes = seed.as_bytes();
+            let mut nonce_bytes = [0u8; 16];
+            let mut nonce_hex = [0u8; NONCE_HEX_LEN];
 
             while !found.load(Ordering::Relaxed) {
-                let nonce = random_nonce();
+                rand::rng().fill(&mut nonce_bytes);
+                let nonce_val = u128::from_be_bytes(nonce_bytes);
+                write_nonce_hex(&mut nonce_hex, nonce_val);
                 let ok = w
                     .verify_vm_chain(
                         ch_bytes,
@@ -976,10 +980,13 @@ fn mine_worker(
                         chain_update_every,
                         sample_words,
                         bits,
-                        nonce.as_bytes(),
+                        &nonce_hex,
                     )
                     .unwrap_or(false);
                 if ok {
+                    let nonce = std::str::from_utf8(&nonce_hex)
+                        .expect("nonce hex utf8")
+                        .to_string();
                     if !found.swap(true, Ordering::SeqCst) {
                         let _ = tx.blocking_send(MiningResult { nonce, round_id });
                     }
@@ -1001,16 +1008,23 @@ fn mine_worker(
             let mut w = WasmWorker::new(&engine, &module).expect("wasm init");
             let ch_bytes = challenge.as_bytes();
             let seed_bytes = seed.as_bytes();
+            let mut nonce_bytes = [0u8; 16];
+            let mut nonce_hex = [0u8; NONCE_HEX_LEN];
 
             while !found.load(Ordering::Relaxed) {
-                let nonce = random_nonce();
+                rand::rng().fill(&mut nonce_bytes);
+                let nonce_val = u128::from_be_bytes(nonce_bytes);
+                write_nonce_hex(&mut nonce_hex, nonce_val);
                 let ok = w
                     .verify_argon2d_chain(
                         ch_bytes, seed_bytes, mem_blocks, passes, lanes, bits,
-                        nonce.as_bytes(),
+                        &nonce_hex,
                     )
                     .unwrap_or(false);
                 if ok {
+                    let nonce = std::str::from_utf8(&nonce_hex)
+                        .expect("nonce hex utf8")
+                        .to_string();
                     if !found.swap(true, Ordering::SeqCst) {
                         let _ = tx.blocking_send(MiningResult { nonce, round_id });
                     }
@@ -1109,10 +1123,8 @@ impl CpuMiningJob {
     }
 }
 
-#[cfg(feature = "cuda")]
 const NONCE_HEX_LEN: usize = 32;
 
-#[cfg(feature = "cuda")]
 fn write_nonce_hex(out: &mut [u8; NONCE_HEX_LEN], mut value: u128) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for i in (0..16).rev() {
@@ -1912,6 +1924,74 @@ fn print_banner() {
     println!();
 }
 
+
+#[cfg(windows)]
+fn apply_cpu_tuning(args: &[String]) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, SetProcessAffinityMask,
+        ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+        IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+    };
+
+    let priority = args
+        .iter()
+        .find(|a| a.starts_with("--cpu-priority="))
+        .map(|a| a.trim_start_matches("--cpu-priority=").to_ascii_lowercase());
+
+    if let Some(p) = priority {
+        let class = match p.as_str() {
+            "idle" | "low" => IDLE_PRIORITY_CLASS,
+            "below_normal" => BELOW_NORMAL_PRIORITY_CLASS,
+            "normal" => NORMAL_PRIORITY_CLASS,
+            "above_normal" => ABOVE_NORMAL_PRIORITY_CLASS,
+            "high" => HIGH_PRIORITY_CLASS,
+            "realtime" => REALTIME_PRIORITY_CLASS,
+            _ => {
+                eprintln!("[!] Unknown --cpu-priority value: {}", p);
+                0
+            }
+        };
+        if class != 0 {
+            let ok = unsafe { SetPriorityClass(GetCurrentProcess(), class) };
+            if ok == 0 {
+                eprintln!("[!] Failed to set process priority");
+            } else {
+                println!("[*] CPU priority set to {}", p);
+            }
+        }
+    }
+
+    let affinity = args
+        .iter()
+        .find(|a| a.starts_with("--cpu-affinity="))
+        .map(|a| a.trim_start_matches("--cpu-affinity=").to_ascii_lowercase());
+
+    if let Some(mask_str) = affinity {
+        let mask = if let Some(hex) = mask_str.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            mask_str.parse::<u64>().ok()
+        };
+        if let Some(mask) = mask {
+            if mask == 0 {
+                eprintln!("[!] --cpu-affinity mask cannot be 0");
+            } else {
+                let ok = unsafe { SetProcessAffinityMask(GetCurrentProcess(), mask as usize) };
+                if ok == 0 {
+                    eprintln!("[!] Failed to set process affinity mask");
+                } else {
+                    println!("[*] CPU affinity mask set to 0x{:x}", mask);
+                }
+            }
+        } else {
+            eprintln!("[!] Invalid --cpu-affinity value: {}", mask_str);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_cpu_tuning(_args: &[String]) {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     print_banner();
@@ -1928,6 +2008,8 @@ async fn main() -> Result<()> {
         println!("  --gpu-device=<N> CUDA device index (default: 0)");
         println!("  --gpu-batch=<N>  CUDA batch size for ARGON2D_CHAIN (default: 256)");
         println!("  --gpu-jobs-per-block=<N>  Fix argon2 jobs per block (power of two, default: auto)");
+        println!("  --cpu-priority=<idle|below_normal|normal|above_normal|high|realtime>");
+        println!("  --cpu-affinity=<mask>  Set process affinity mask (decimal or 0x..)");
         println!("  --help          显示帮助");
         println!();
         println!("启动后在浏览器控制台粘贴 bridge.js 即可开始挖矿。");
@@ -1935,6 +2017,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    apply_cpu_tuning(&args);
     let thread_count: u32 = args
         .iter()
         .find(|a| a.starts_with("--threads="))
@@ -2018,6 +2101,10 @@ async fn main() -> Result<()> {
     let wasm_bytes = load_wasm_bytes()?;
     let mut wasm_config = Config::new();
     wasm_config.cranelift_opt_level(OptLevel::Speed);
+    wasm_config.wasm_simd(true);
+    if let Err(e) = wasm_config.cache_config_load_default() {
+        eprintln!("[!] WASM cache disabled: {}", e);
+    }
     let engine = Arc::new(Engine::new(&wasm_config)?);
     let module = Arc::new(Module::new(&engine, &wasm_bytes)?);
     println!("[*] WASM 模块加载成功 ({} bytes)", wasm_bytes.len());
