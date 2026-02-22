@@ -13,9 +13,6 @@
   const RUST_URL = "http://localhost:19527/";
   let WITHDRAW_THRESHOLD_MICRO = 100_000_00;
   const SUBMIT_RETRY_MAX = 3;
-  const SUBMIT_RETRY_DELAY_400_MS = 600;
-  const SUBMIT_RETRY_DELAY_429_MIN_MS = 1000;
-  const SUBMIT_RETRY_DELAY_429_MAX_MS = 2000;
   const MIN_SUBMIT_INTERVAL_MS = 1200;
 
   // ---- 清理旧桥接实例 ----
@@ -196,27 +193,19 @@
           wsSecret = null;
           return null;
         }
-
         if (r.status === 400) {
-          const backoff = Math.floor(SUBMIT_RETRY_DELAY_400_MS * (2 ** attempt));
-          log(`提交 400，${attempt + 1}/${SUBMIT_RETRY_MAX}，${backoff}ms 后重试`, "warn");
-          if (attempt < SUBMIT_RETRY_MAX - 1) {
-            await sleep(backoff);
-            continue;
-          }
-          return null;
+          log("Submit 400: skip this round", "warn");
+          lastSubmittedRoundId = roundId;
+          return { status: "skip", reason: "http_400" };
         }
 
         if (r.status === 429) {
           const raMs = getRetryAfterMs(r);
-          const base = SUBMIT_RETRY_DELAY_429_MIN_MS +
-            Math.random() * (SUBMIT_RETRY_DELAY_429_MAX_MS - SUBMIT_RETRY_DELAY_429_MIN_MS);
-          const backoff = Math.floor((raMs !== null ? raMs : base * (2 ** attempt)) + Math.random() * 200);
-          log(`提交 429 限流，${attempt + 1}/${SUBMIT_RETRY_MAX}，${backoff}ms 后重试`, "warn");
-          if (attempt < SUBMIT_RETRY_MAX - 1) {
-            await sleep(backoff);
-            continue;
-          }
+          const raInfo = raMs !== null ? ` (Retry-After=${raMs}ms)` : "";
+          log(`Submit 429: skip this round${raInfo}`, "warn");
+          lastSubmittedRoundId = roundId;
+          return { status: "skip", reason: "http_429" };
+        }
           return null;
         }
 
@@ -350,6 +339,10 @@
           const result = await submitSolution(sol.track, sol.roundId, sol.nonce);
           if (!result) {
             log("提交失败，稍后重试", "warn");
+            continue;
+          }
+
+          if (result?.status === "skip") {
             continue;
           }
 
