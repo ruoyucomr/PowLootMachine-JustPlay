@@ -206,8 +206,6 @@
           lastSubmittedRoundId = roundId;
           return { status: "skip", reason: "http_429" };
         }
-          return null;
-        }
 
         log(`提交 HTTP ${r.status} (attempt ${attempt + 1})`, "error");
         if (attempt < SUBMIT_RETRY_MAX - 1) await sleep(500);
