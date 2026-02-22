@@ -14,8 +14,7 @@
   let WITHDRAW_THRESHOLD_MICRO = 100_000_00;
   const SUBMIT_RETRY_MAX = 3;
   const MIN_SUBMIT_INTERVAL_MS = 1200;
-  const ARGON2D_TRACK = "ARGON2D_CHAIN";
-  const ARGON2D_SUBMIT_BASE_DELAY_MS = 500;
+  const TRACK_DELAY_STEP_MS = 1000;
 
   // ---- 清理旧桥接实例 ----
   if (window.__plbridge) {
@@ -61,7 +60,15 @@
     return null;
   }
   let lastSubmitAt = 0;
-  let argon2dSubmitDelayMs = ARGON2D_SUBMIT_BASE_DELAY_MS;
+  const submitDelayByTrack = new Map();
+  function getTrackDelay(track) {
+    return submitDelayByTrack.get(track) || 0;
+  }
+  function bumpTrackDelay(track) {
+    const next = getTrackDelay(track) + TRACK_DELAY_STEP_MS;
+    submitDelayByTrack.set(track, next);
+    return next;
+  }
 
   // ---- 状态 ----
   let wsSecret = null;
@@ -175,8 +182,9 @@
         }
         const jitter = 200 + Math.random() * 300;
         await sleep(jitter);
-        if (track === ARGON2D_TRACK) {
-          await sleep(argon2dSubmitDelayMs);
+        const extraDelay = getTrackDelay(track);
+        if (extraDelay > 0) {
+          await sleep(extraDelay);
         }
         lastSubmitAt = Date.now();
 
@@ -200,22 +208,17 @@
           return null;
         }
         if (r.status === 400) {
-          if (track === ARGON2D_TRACK) {
-            argon2dSubmitDelayMs += 1000;
-            log(`ARGON2D 提交延时 +1s -> ${argon2dSubmitDelayMs}ms`, "warn");
-          }
+          const nextDelay = bumpTrackDelay(track);
+          log(`${track} submit delay +1s -> ${nextDelay}ms`, "warn");
           log("Submit 400: skip this round", "warn");
           lastSubmittedRoundId = roundId;
           return { status: "skip", reason: "http_400" };
         }
-
         if (r.status === 429) {
           const raMs = getRetryAfterMs(r);
           const raInfo = raMs !== null ? ` (Retry-After=${raMs}ms)` : "";
-          if (track === ARGON2D_TRACK) {
-            argon2dSubmitDelayMs += 1000;
-            log(`ARGON2D 提交延时 +1s -> ${argon2dSubmitDelayMs}ms`, "warn");
-          }
+          const nextDelay = bumpTrackDelay(track);
+          log(`${track} submit delay +1s -> ${nextDelay}ms`, "warn");
           log(`Submit 429: skip this round${raInfo}`, "warn");
           lastSubmittedRoundId = roundId;
           return { status: "skip", reason: "http_429" };
