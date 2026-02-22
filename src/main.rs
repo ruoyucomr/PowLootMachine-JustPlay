@@ -2002,7 +2002,7 @@ async fn main() -> Result<()> {
         println!("用法: powloot-machine [选项]");
         println!();
         println!("选项:");
-        println!("  --threads=<N>   挖矿线程数 (默认: CPU 核心数)");
+        println!("  --threads=<N>   threads (default: CPU cores -1/-2)");
         println!("  --port=<PORT>   服务端口 (默认: {})", DEFAULT_PORT);
         println!("  --gpu           Enable CUDA mining (all tracks except VM_CHAIN)");
         println!("  --gpu-device=<N> CUDA device index (default: 0)");
@@ -2018,11 +2018,15 @@ async fn main() -> Result<()> {
     }
 
     apply_cpu_tuning(&args);
+    let detected_threads: u32 = num_cpus::get().max(1) as u32;
+    let reserve_threads: u32 = if detected_threads >= 8 { 2 } else { 1 };
+    let default_threads: u32 = detected_threads.saturating_sub(reserve_threads).max(1);
+
     let thread_count: u32 = args
         .iter()
         .find(|a| a.starts_with("--threads="))
         .and_then(|a| a.trim_start_matches("--threads=").parse().ok())
-        .unwrap_or(num_cpus::get() as u32);
+        .unwrap_or(default_threads);
 
     let port: u16 = args
         .iter()
