@@ -4,12 +4,13 @@
 //! 5 个简单赛道使用原生 Rust SHA256（SHA-NI 硬件加速），
 //! VM_CHAIN 和 ARGON2D_CHAIN 使用 wasmtime 调用原始 WASM 二进制。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write as IoWrite;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,8 +19,21 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
+#[cfg(feature = "cuda")]
+mod gpu;
+
 const CODE_FILE: &str = "powloot_codes.txt";
 const DEFAULT_PORT: u16 = 19527;
+
+#[derive(Clone, Debug)]
+struct AppConfig {
+    thread_count: u32,
+    port: u16,
+    use_gpu: bool,
+    gpu_device: usize,
+    gpu_batch: usize,
+    gpu_jobs_per_block: u32,
+}
 
 // ============================================================
 // WS 协议 — 浏览器 → Rust
@@ -536,8 +550,18 @@ fn verify_tiny_vm(
 // WASM 引擎 — VM_CHAIN + ARGON2D_CHAIN
 // ============================================================
 
-const WASM_BYTES: &[u8] =
-    include_bytes!("../PowLoot/static/wasm/powloot_wasm.wasm-0002330e");
+fn load_wasm_bytes() -> Result<Vec<u8>> {
+    let default_path = PathBuf::from("PowLoot")
+        .join("static")
+        .join("wasm")
+        .join("powloot_wasm.wasm-0002330e");
+    let path = std::env::var("POWLOOT_WASM")
+        .map(PathBuf::from)
+        .unwrap_or(default_path);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("无法读取 WASM 文件: {}", path.display()))?;
+    Ok(bytes)
+}
 
 struct WasmWorker {
     store: Store<()>,
@@ -850,7 +874,7 @@ fn mine_worker(
 // 挖矿任务管理
 // ============================================================
 
-struct MiningJob {
+struct CpuMiningJob {
     found: Arc<AtomicBool>,
     hash_counter: Arc<AtomicU64>,
     handles: Vec<std::thread::JoinHandle<()>>,
@@ -859,7 +883,7 @@ struct MiningJob {
     last_time: Instant,
 }
 
-impl MiningJob {
+impl CpuMiningJob {
     fn start(
         track_params: TrackParams,
         round_id: &str,
@@ -887,7 +911,7 @@ impl MiningJob {
         }
 
         let now = Instant::now();
-        MiningJob {
+        CpuMiningJob {
             found,
             hash_counter,
             handles,
@@ -923,8 +947,338 @@ impl MiningJob {
             attempts: current_count,
         }
     }
+
+    fn start_time(&self) -> Instant {
+        self.start_time
+    }
+
+    fn attempts(&self) -> u64 {
+        self.hash_counter.load(Ordering::Relaxed)
+    }
 }
 
+#[cfg(feature = "cuda")]
+const NONCE_HEX_LEN: usize = 32;
+
+#[cfg(feature = "cuda")]
+fn write_nonce_hex(out: &mut [u8; NONCE_HEX_LEN], mut value: u128) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in (0..16).rev() {
+        let byte = (value & 0xff) as u8;
+        value >>= 8;
+        let idx = i * 2;
+        out[idx] = HEX[(byte >> 4) as usize];
+        out[idx + 1] = HEX[(byte & 0x0f) as usize];
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_worker(
+    mut miner: gpu::GpuMiner,
+    difficulty: u32,
+    batch_size: usize,
+    found: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<MiningResult>,
+    hash_counter: Arc<AtomicU64>,
+    round_id: String,
+) {
+    let stride = NONCE_HEX_LEN;
+    let mut pw_buf = vec![0u8; batch_size * stride];
+    let pw_lens = vec![NONCE_HEX_LEN as u32; batch_size];
+    let mut hashes = vec![0u8; batch_size * 32];
+    let mut nonce_base: u128 = rand::random::<u128>();
+    let mut nonce_tmp = [0u8; NONCE_HEX_LEN];
+
+    while !found.load(Ordering::Relaxed) {
+        for i in 0..batch_size {
+            let offset = i * stride;
+            write_nonce_hex(&mut nonce_tmp, nonce_base.wrapping_add(i as u128));
+            pw_buf[offset..offset + NONCE_HEX_LEN].copy_from_slice(&nonce_tmp);
+        }
+
+        if let Err(err) = miner.hash_batch(&pw_buf, stride, &pw_lens, batch_size, &mut hashes) {
+            eprintln!("[!] GPU batch failed: {}", err);
+            found.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        hash_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
+
+        for i in 0..batch_size {
+            let offset = i * 32;
+            let hash = &hashes[offset..offset + 32];
+            if leading_zero_bits(hash) >= difficulty {
+                let nonce_val = nonce_base.wrapping_add(i as u128);
+                let mut nonce_buf = [0u8; NONCE_HEX_LEN];
+                write_nonce_hex(&mut nonce_buf, nonce_val);
+                let nonce = String::from_utf8_lossy(&nonce_buf).to_string();
+                if !found.swap(true, Ordering::SeqCst) {
+                    let _ = tx.blocking_send(MiningResult { nonce, round_id });
+                }
+                return;
+            }
+        }
+
+        nonce_base = nonce_base.wrapping_add(batch_size as u128);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_powloot_worker(
+    mut job: gpu::PowGpuJob,
+    found: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<MiningResult>,
+    hash_counter: Arc<AtomicU64>,
+    round_id: String,
+) {
+    let mut nonce_prefix = [0u8; 12];
+    while !found.load(Ordering::Relaxed) {
+        rand::rng().fill(&mut nonce_prefix);
+        let result = job.run(&nonce_prefix);
+        if let Ok(_) = result {
+            hash_counter.fetch_add(job.batch_size() as u64, Ordering::Relaxed);
+        }
+        match result {
+            Ok(Some(nonce_bytes)) => {
+                let nonce = hex::encode(nonce_bytes);
+                if !found.swap(true, Ordering::SeqCst) {
+                    let _ = tx.blocking_send(MiningResult { nonce, round_id });
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("[!] GPU batch failed: {}", err);
+                found.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct GpuMiningJob {
+    found: Arc<AtomicBool>,
+    hash_counter: Arc<AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    start_time: Instant,
+    last_count: u64,
+    last_time: Instant,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuMiningJob {
+    fn start(
+        challenge: &str,
+        seed: &str,
+        bits: u32,
+        mem_blocks: u32,
+        passes: u32,
+        lanes: u32,
+        jobs_per_block: u32,
+        device_index: usize,
+        batch_size: usize,
+        round_id: &str,
+        solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
+    ) -> anyhow::Result<Self> {
+        let found = Arc::new(AtomicBool::new(false));
+        let hash_counter = Arc::new(AtomicU64::new(0));
+
+        // Assumption: ARGON2D_CHAIN uses salt = challenge + seed, password = nonce.
+        let mut salt = Vec::with_capacity(challenge.len() + seed.len());
+        salt.extend_from_slice(challenge.as_bytes());
+        salt.extend_from_slice(seed.as_bytes());
+
+        let miner = gpu::GpuMiner::new(
+            device_index,
+            &salt,
+            mem_blocks,
+            passes,
+            lanes,
+            jobs_per_block,
+            batch_size,
+        )?;
+        let actual_batch = miner.batch_size();
+        let rid = round_id.to_string();
+
+        let found_t = found.clone();
+        let counter_t = hash_counter.clone();
+        let start_time = Instant::now();
+        let handle = std::thread::spawn(move || {
+            gpu_worker(miner, bits, actual_batch, found_t, solution_tx, counter_t, rid);
+        });
+
+        Ok(GpuMiningJob {
+            found,
+            hash_counter,
+            handle: Some(handle),
+            start_time,
+            last_count: 0,
+            last_time: start_time,
+        })
+    }
+
+    fn start_powloot(
+        job: gpu::PowGpuJob,
+        round_id: &str,
+        solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
+    ) -> anyhow::Result<Self> {
+        let found = Arc::new(AtomicBool::new(false));
+        let hash_counter = Arc::new(AtomicU64::new(0));
+
+        let rid = round_id.to_string();
+        let found_t = found.clone();
+        let counter_t = hash_counter.clone();
+        let start_time = Instant::now();
+        let handle = std::thread::spawn(move || {
+            gpu_powloot_worker(job, found_t, solution_tx, counter_t, rid);
+        });
+
+        Ok(GpuMiningJob {
+            found,
+            hash_counter,
+            handle: Some(handle),
+            start_time,
+            last_count: 0,
+            last_time: start_time,
+        })
+    }
+
+    fn stop(&mut self) {
+        self.found.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn get_status(&mut self) -> ServerMsg {
+        let now = Instant::now();
+        let current_count = self.hash_counter.load(Ordering::Relaxed);
+        let elapsed = now.duration_since(self.last_time).as_secs_f64();
+
+        let hash_rate = if elapsed > 0.1 {
+            (current_count - self.last_count) as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        self.last_count = current_count;
+        self.last_time = now;
+
+        ServerMsg::Status {
+            hash_rate,
+            attempts: current_count,
+        }
+    }
+
+    fn start_time(&self) -> Instant {
+        self.start_time
+    }
+
+    fn attempts(&self) -> u64 {
+        self.hash_counter.load(Ordering::Relaxed)
+    }
+}
+
+enum MiningJob {
+    Cpu(CpuMiningJob),
+    #[cfg(feature = "cuda")]
+    Gpu(GpuMiningJob),
+}
+
+impl MiningJob {
+    fn start_cpu(
+        track_params: TrackParams,
+        round_id: &str,
+        thread_count: u32,
+        solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
+        wasm_engine: Option<Arc<Engine>>,
+        wasm_module: Option<Arc<Module>>,
+    ) -> Self {
+        MiningJob::Cpu(CpuMiningJob::start(
+            track_params,
+            round_id,
+            thread_count,
+            solution_tx,
+            wasm_engine,
+            wasm_module,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn start_gpu_argon2d(
+        challenge: &str,
+        seed: &str,
+        bits: u32,
+        mem_blocks: u32,
+        passes: u32,
+        lanes: u32,
+        jobs_per_block: u32,
+        device_index: usize,
+        batch_size: usize,
+        round_id: &str,
+        solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
+    ) -> anyhow::Result<Self> {
+        Ok(MiningJob::Gpu(GpuMiningJob::start(
+            challenge,
+            seed,
+            bits,
+            mem_blocks,
+            passes,
+            lanes,
+            jobs_per_block,
+            device_index,
+            batch_size,
+            round_id,
+            solution_tx,
+        )?))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn start_gpu_powloot(
+        job: gpu::PowGpuJob,
+        round_id: &str,
+        solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
+    ) -> anyhow::Result<Self> {
+        Ok(MiningJob::Gpu(GpuMiningJob::start_powloot(
+            job,
+            round_id,
+            solution_tx,
+        )?))
+    }
+
+    fn stop(&mut self) {
+        match self {
+            MiningJob::Cpu(job) => job.stop(),
+            #[cfg(feature = "cuda")]
+            MiningJob::Gpu(job) => job.stop(),
+        }
+    }
+
+    fn get_status(&mut self) -> ServerMsg {
+        match self {
+            MiningJob::Cpu(job) => job.get_status(),
+            #[cfg(feature = "cuda")]
+            MiningJob::Gpu(job) => job.get_status(),
+        }
+    }
+
+    fn start_time(&self) -> Instant {
+        match self {
+            MiningJob::Cpu(job) => job.start_time(),
+            #[cfg(feature = "cuda")]
+            MiningJob::Gpu(job) => job.start_time(),
+        }
+    }
+
+    fn attempts(&self) -> u64 {
+        match self {
+            MiningJob::Cpu(job) => job.attempts(),
+            #[cfg(feature = "cuda")]
+            MiningJob::Gpu(job) => job.attempts(),
+        }
+    }
+}
 // ============================================================
 // 兑换码保存
 // ============================================================
@@ -964,7 +1318,7 @@ window.addEventListener('message', e => {
 
 async fn handle_tcp_connection(
     mut stream: tokio::net::TcpStream,
-    thread_count: u32,
+    config: AppConfig,
     wasm_engine: Arc<Engine>,
     wasm_module: Arc<Module>,
 ) -> Result<()> {
@@ -976,7 +1330,7 @@ async fn handle_tcp_connection(
     if request_str.contains("Upgrade: websocket") || request_str.contains("upgrade: websocket") {
         // WebSocket upgrade
         let ws = tokio_tungstenite::accept_async(stream).await?;
-        handle_ws(ws, thread_count, wasm_engine, wasm_module).await?;
+        handle_ws(ws, config, wasm_engine, wasm_module).await?;
     } else if request_str.starts_with("GET") {
         // Serve relay HTML
         let body = RELAY_HTML;
@@ -1006,7 +1360,7 @@ async fn handle_tcp_connection(
 
 async fn handle_ws(
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    thread_count: u32,
+    config: AppConfig,
     wasm_engine: Arc<Engine>,
     wasm_module: Arc<Module>,
 ) -> Result<()> {
@@ -1014,10 +1368,10 @@ async fn handle_ws(
 
     // 发送 ready
     let ready = serde_json::to_string(&ServerMsg::Ready {
-        threads: thread_count,
+        threads: config.thread_count,
     })?;
     write.send(Message::Text(ready.into())).await?;
-    println!("[+] 已发送 ready (threads={})", thread_count);
+    println!("[+] 已发送 ready (threads={})", config.thread_count);
 
     let (solution_tx, mut solution_rx) = tokio::sync::mpsc::channel::<MiningResult>(4);
     let mut mining_job: Option<MiningJob> = None;
@@ -1041,22 +1395,307 @@ async fn handle_ws(
 
                                 match parse_track_params(&track, &params) {
                                     Ok(track_params) => {
-                                        println!(
-                                            "[*] 开始挖矿: track={} round={} bits={} threads={}",
-                                            track,
-                                            &round_id[..8.min(round_id.len())],
-                                            params.get("bits").and_then(|v| v.as_u64()).unwrap_or(0),
-                                            thread_count,
-                                        );
+                                        let job_bits = params
+                                            .get("bits")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0) as u32;
 
-                                        mining_job = Some(MiningJob::start(
-                                            track_params,
-                                            &round_id,
-                                            thread_count,
-                                            solution_tx.clone(),
-                                            Some(wasm_engine.clone()),
-                                            Some(wasm_module.clone()),
-                                        ));
+                                        let mut started = false;
+
+                                        if config.use_gpu {
+                                            #[cfg(feature = "cuda")]
+                                            {
+                                                match &track_params {
+                                                    TrackParams::Argon2dChain {
+                                                        challenge,
+                                                        seed,
+                                                        mem_blocks,
+                                                        passes,
+                                                        lanes,
+                                                        bits,
+                                                    } => {
+                                                        println!(
+                                                            "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                            track,
+                                                            &round_id[..8.min(round_id.len())],
+                                                            bits,
+                                                            config.gpu_device,
+                                                            config.gpu_batch,
+                                                        );
+                                                        match MiningJob::start_gpu_argon2d(
+                                                            challenge,
+                                                            seed,
+                                                            *bits,
+                                                            *mem_blocks,
+                                                            *passes,
+                                                            *lanes,
+                                                            config.gpu_jobs_per_block,
+                                                            config.gpu_device,
+                                                            config.gpu_batch,
+                                                            &round_id,
+                                                            solution_tx.clone(),
+                                                        ) {
+                                                            Ok(job) => {
+                                                                mining_job = Some(job);
+                                                                started = true;
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[!] GPU init failed: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    TrackParams::CpuHash { challenge, bits } => {
+                                                        match gpu::PowGpuJob::cpu_hash(
+                                                            config.gpu_device,
+                                                            challenge.as_bytes(),
+                                                            *bits,
+                                                        ) {
+                                                            Ok(job) => {
+                                                                let batch = job.batch_size();
+                                                                println!(
+                                                                    "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                                    track,
+                                                                    &round_id[..8.min(round_id.len())],
+                                                                    bits,
+                                                                    config.gpu_device,
+                                                                    batch,
+                                                                );
+                                                                match MiningJob::start_gpu_powloot(
+                                                                    job,
+                                                                    &round_id,
+                                                                    solution_tx.clone(),
+                                                                ) {
+                                                                    Ok(job) => {
+                                                                        mining_job = Some(job);
+                                                                        started = true;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("[!] GPU init failed: {}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[!] GPU init failed: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    TrackParams::Chain {
+                                                        challenge,
+                                                        seed_bytes,
+                                                        steps,
+                                                        bits,
+                                                    } => {
+                                                        let mut prefix =
+                                                            Vec::with_capacity(challenge.len() + seed_bytes.len());
+                                                        prefix.extend_from_slice(challenge.as_bytes());
+                                                        prefix.extend_from_slice(seed_bytes);
+                                                        match gpu::PowGpuJob::chain(
+                                                            config.gpu_device,
+                                                            &prefix,
+                                                            *steps,
+                                                            *bits,
+                                                        ) {
+                                                            Ok(job) => {
+                                                                let batch = job.batch_size();
+                                                                println!(
+                                                                    "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                                    track,
+                                                                    &round_id[..8.min(round_id.len())],
+                                                                    bits,
+                                                                    config.gpu_device,
+                                                                    batch,
+                                                                );
+                                                                match MiningJob::start_gpu_powloot(
+                                                                    job,
+                                                                    &round_id,
+                                                                    solution_tx.clone(),
+                                                                ) {
+                                                                    Ok(job) => {
+                                                                        mining_job = Some(job);
+                                                                        started = true;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("[!] GPU init failed: {}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[!] GPU init failed: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    TrackParams::BranchyMix {
+                                                        challenge,
+                                                        seed,
+                                                        rounds,
+                                                        bits,
+                                                    } => {
+                                                        let mut prefix =
+                                                            Vec::with_capacity(challenge.len() + seed.len());
+                                                        prefix.extend_from_slice(challenge.as_bytes());
+                                                        prefix.extend_from_slice(seed.as_bytes());
+                                                        match gpu::PowGpuJob::branchy_mix(
+                                                            config.gpu_device,
+                                                            &prefix,
+                                                            *rounds,
+                                                            *bits,
+                                                        ) {
+                                                            Ok(job) => {
+                                                                let batch = job.batch_size();
+                                                                println!(
+                                                                    "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                                    track,
+                                                                    &round_id[..8.min(round_id.len())],
+                                                                    bits,
+                                                                    config.gpu_device,
+                                                                    batch,
+                                                                );
+                                                                match MiningJob::start_gpu_powloot(
+                                                                    job,
+                                                                    &round_id,
+                                                                    solution_tx.clone(),
+                                                                ) {
+                                                                    Ok(job) => {
+                                                                        mining_job = Some(job);
+                                                                        started = true;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("[!] GPU init failed: {}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[!] GPU init failed: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    TrackParams::MemWork {
+                                                        challenge,
+                                                        seed_bytes,
+                                                        steps,
+                                                        lanes,
+                                                        lane_size,
+                                                        bits,
+                                                    } => {
+                                                        let total = (*lanes as usize)
+                                                            .saturating_mul(*lane_size as usize);
+                                                        if total == 0 {
+                                                            eprintln!("[!] MEM_WORK total size is 0");
+                                                        } else {
+                                                            let init_mem = build_mem_work_base(seed_bytes, total);
+                                                            let mut acc_prefix = Vec::with_capacity(
+                                                                4 + seed_bytes.len() + challenge.len(),
+                                                            );
+                                                            acc_prefix.extend_from_slice(b"acc:");
+                                                            acc_prefix.extend_from_slice(seed_bytes);
+                                                            acc_prefix.extend_from_slice(challenge.as_bytes());
+                                                            match gpu::PowGpuJob::mem_work(
+                                                                config.gpu_device,
+                                                                &init_mem,
+                                                                &acc_prefix,
+                                                                *steps,
+                                                                *bits,
+                                                            ) {
+                                                                Ok(job) => {
+                                                                    let batch = job.batch_size();
+                                                                    println!(
+                                                                        "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                                        track,
+                                                                        &round_id[..8.min(round_id.len())],
+                                                                        bits,
+                                                                        config.gpu_device,
+                                                                        batch,
+                                                                    );
+                                                                    match MiningJob::start_gpu_powloot(
+                                                                        job,
+                                                                        &round_id,
+                                                                        solution_tx.clone(),
+                                                                    ) {
+                                                                        Ok(job) => {
+                                                                            mining_job = Some(job);
+                                                                            started = true;
+                                                                        }
+                                                                        Err(e) => {
+                                                                            eprintln!("[!] GPU init failed: {}", e);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("[!] GPU init failed: {}", e);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    TrackParams::TinyVm {
+                                                        challenge,
+                                                        seed,
+                                                        program,
+                                                        steps,
+                                                        bits,
+                                                    } => {
+                                                        match gpu::PowGpuJob::tiny_vm(
+                                                            config.gpu_device,
+                                                            challenge.as_bytes(),
+                                                            seed.as_bytes(),
+                                                            program,
+                                                            *steps,
+                                                            *bits,
+                                                        ) {
+                                                            Ok(job) => {
+                                                                let batch = job.batch_size();
+                                                                println!(
+                                                                    "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                                    track,
+                                                                    &round_id[..8.min(round_id.len())],
+                                                                    bits,
+                                                                    config.gpu_device,
+                                                                    batch,
+                                                                );
+                                                                match MiningJob::start_gpu_powloot(
+                                                                    job,
+                                                                    &round_id,
+                                                                    solution_tx.clone(),
+                                                                ) {
+                                                                    Ok(job) => {
+                                                                        mining_job = Some(job);
+                                                                        started = true;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("[!] GPU init failed: {}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[!] GPU init failed: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    TrackParams::VmChain { .. } => {}
+                                                }
+                                            }
+                                            #[cfg(not(feature = "cuda"))]
+                                            {
+                                                eprintln!("[!] CUDA support not enabled, rebuild with --features cuda");
+                                            }
+                                        }
+
+                                        if !started {
+                                            println!(
+                                                "[*] ??????? track={} round={} bits={} threads={}",
+                                                track,
+                                                &round_id[..8.min(round_id.len())],
+                                                job_bits,
+                                                config.thread_count,
+                                            );
+                                            mining_job = Some(MiningJob::start_cpu(
+                                                track_params,
+                                                &round_id,
+                                                config.thread_count,
+                                                solution_tx.clone(),
+                                                Some(wasm_engine.clone()),
+                                                Some(wasm_module.clone()),
+                                            ));
+                                        }
                                         status_interval.reset();
                                     }
                                     Err(e) => {
@@ -1066,7 +1705,7 @@ async fn handle_ws(
                             }
                             Ok(ClientMsg::Stop) => {
                                 if let Some(mut job) = mining_job.take() {
-                                    let elapsed = job.start_time.elapsed();
+                                    let elapsed = job.start_time().elapsed();
                                     job.stop();
                                     println!("[*] 停止挖矿: 耗时={:.1}s", elapsed.as_secs_f64());
                                     let msg = serde_json::to_string(&ServerMsg::Stopped)?;
@@ -1099,10 +1738,10 @@ async fn handle_ws(
             result = solution_rx.recv() => {
                 if let Some(result) = result {
                     if let Some(job) = mining_job.as_ref() {
-                        let elapsed = job.start_time.elapsed();
-                        let attempts = job.hash_counter.load(Ordering::Relaxed);
+                        let elapsed = job.start_time().elapsed();
+                        let attempts = job.attempts();
                         println!(
-                            "[+] 找到解! nonce={}... round={} 耗时={:.2}s 尝试={}",
+                            "[+] ??? nonce={}... round={} ??={:.2}s ??={}",
                             &result.nonce[..8],
                             &result.round_id[..8.min(result.round_id.len())],
                             elapsed.as_secs_f64(),
@@ -1163,6 +1802,10 @@ async fn main() -> Result<()> {
         println!("选项:");
         println!("  --threads=<N>   挖矿线程数 (默认: CPU 核心数)");
         println!("  --port=<PORT>   服务端口 (默认: {})", DEFAULT_PORT);
+        println!("  --gpu           Enable CUDA mining (all tracks except VM_CHAIN)");
+        println!("  --gpu-device=<N> CUDA device index (default: 0)");
+        println!("  --gpu-batch=<N>  CUDA batch size for ARGON2D_CHAIN (default: 256)");
+        println!("  --gpu-jobs-per-block=<N>  Fix argon2 jobs per block (power of two, default: auto)");
         println!("  --help          显示帮助");
         println!();
         println!("启动后在浏览器控制台粘贴 bridge.js 即可开始挖矿。");
@@ -1182,27 +1825,95 @@ async fn main() -> Result<()> {
         .and_then(|a| a.trim_start_matches("--port=").parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
+    let use_gpu = args.iter().any(|a| a == "--gpu");
+    let gpu_device: usize = args
+        .iter()
+        .find(|a| a.starts_with("--gpu-device="))
+        .and_then(|a| a.trim_start_matches("--gpu-device=").parse().ok())
+        .unwrap_or(0);
+
+    let gpu_batch: usize = args
+        .iter()
+        .find(|a| a.starts_with("--gpu-batch="))
+        .and_then(|a| a.trim_start_matches("--gpu-batch=").parse().ok())
+        .unwrap_or(256);
+
+    let mut gpu_jobs_per_block_opt: Option<u32> = None;
+    for arg in &args {
+        if let Some(raw) = arg.strip_prefix("--gpu-jobs-per-block=") {
+            match raw.parse::<u32>() {
+                Ok(v) => gpu_jobs_per_block_opt = Some(v),
+                Err(_) => {
+                    eprintln!("[!] Invalid --gpu-jobs-per-block value: {}", raw);
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let gpu_jobs_per_block = gpu_jobs_per_block_opt.unwrap_or(0);
+    if gpu_jobs_per_block != 0 && (gpu_jobs_per_block & (gpu_jobs_per_block - 1)) != 0 {
+        eprintln!("[!] --gpu-jobs-per-block must be a power of two");
+        return Ok(());
+    }
+
+
+    #[cfg(feature = "cuda")]
+    if use_gpu {
+        let count = gpu::GpuMiner::device_count()?;
+        if count == 0 {
+            eprintln!("[!] No CUDA devices detected");
+            return Ok(());
+        }
+        if gpu_device >= count {
+            eprintln!("[!] CUDA device index out of range: {} (available 0..{})", gpu_device, count - 1);
+            return Ok(());
+        }
+        let name = gpu::GpuMiner::device_name(gpu_device)?;
+        println!("[*] GPU device: #{} {}", gpu_device, name);
+        println!("[*] GPU batch: {}", gpu_batch.max(1));
+        if gpu_jobs_per_block > 0 {
+            println!("[*] GPU jobs per block: {}", gpu_jobs_per_block);
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    if use_gpu {
+                                                eprintln!("[!] CUDA support not enabled, rebuild with --features cuda");
+        return Ok(());
+    }
+
+    let config = AppConfig {
+        thread_count,
+        port,
+        use_gpu,
+        gpu_device,
+        gpu_batch: gpu_batch.max(1),
+        gpu_jobs_per_block,
+    };
+
     // 初始化 WASM 引擎
     println!("[*] 初始化 WASM 引擎...");
+    let wasm_bytes = load_wasm_bytes()?;
     let engine = Arc::new(Engine::default());
-    let module = Arc::new(Module::new(&engine, WASM_BYTES)?);
-    println!("[*] WASM 模块加载成功 ({} bytes)", WASM_BYTES.len());
+    let module = Arc::new(Module::new(&engine, &wasm_bytes)?);
+    println!("[*] WASM 模块加载成功 ({} bytes)", wasm_bytes.len());
 
-    println!("[*] 线程数: {}", thread_count);
-    println!("[*] 监听端口: http://localhost:{}", port);
+    println!("[*] 线程数: {}", config.thread_count);
+    println!("[*] 监听端口: http://localhost:{}", config.port);
     println!("[*] 兑换码保存: {}", CODE_FILE);
     println!();
     println!("[*] 等待浏览器连接...");
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", config.port)).await?;
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let engine = engine.clone();
         let module = module.clone();
+        let config = config.clone();
 
         tokio::spawn(async move {
-            match handle_tcp_connection(stream, thread_count, engine, module).await {
+            match handle_tcp_connection(stream, config, engine, module).await {
                 Ok(()) => {}
                 Err(e) => {
                     // 中继页 HTML 请求断开是正常的，不打印

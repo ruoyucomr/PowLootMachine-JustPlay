@@ -12,6 +12,11 @@
 
   const RUST_URL = "http://localhost:19527/";
   let WITHDRAW_THRESHOLD_MICRO = 100_000_00;
+  const SUBMIT_RETRY_MAX = 3;
+  const SUBMIT_RETRY_DELAY_400_MS = 600;
+  const SUBMIT_RETRY_DELAY_429_MIN_MS = 1000;
+  const SUBMIT_RETRY_DELAY_429_MAX_MS = 2000;
+  const MIN_SUBMIT_INTERVAL_MS = 1200;
 
   // ---- 清理旧桥接实例 ----
   if (window.__plbridge) {
@@ -45,6 +50,9 @@
       }
     } catch {}
   }
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let lastSubmitAt = 0;
 
   // ---- 状态 ----
   let wsSecret = null;
@@ -138,7 +146,7 @@
 
   // ---- 页面 API ----
   async function fetchChallenge() {
-    const r = await fetch("/challenge", { cache: "no-store" });
+    const r = await fetch("/challenge", { cache: "no-store", credentials: "include" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   }
@@ -149,28 +157,64 @@
     if (wsSecretExpiresAtMs && Date.now() > wsSecretExpiresAtMs + 1500) {
       log("WS secret 已过期，等待刷新...", "warn"); return null;
     }
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < SUBMIT_RETRY_MAX; attempt++) {
       try {
+        const now = Date.now();
+        const waitMs = MIN_SUBMIT_INTERVAL_MS - (now - lastSubmitAt);
+        if (waitMs > 0) {
+          await sleep(waitMs);
+        }
+        const jitter = 200 + Math.random() * 300;
+        await sleep(jitter);
+        lastSubmitAt = Date.now();
+
         const r = await fetch("/submit", {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-POW-SECRET": wsSecret },
+          credentials: "include",
           body: JSON.stringify({ track, round_id: roundId, proof: { nonce } }),
         });
-        if (r.ok) {
-          const ct = r.headers.get("content-type") || "";
-          if (ct.includes("json")) return r.json();
+        const ct = r.headers.get("content-type") || "";
+        let data = null;
+        if (ct.includes("json")) {
+          try { data = await r.json(); } catch {}
         }
-        // 429 = 限流，不要重试（重试只会更糟）
-        if (r.status === 429) {
-          log(`提交 429 限流，跳过`, "warn");
+
+        if (r.ok) return data;
+
+        if (r.status === 401 && data?.reason === "bad_secret") {
+          log("WS secret 无效，等待刷新...", "warn");
+          wsSecret = null;
           return null;
         }
-        // 其他非 200 — 可能是 Cloudflare 拦截，可重试一次
+
+        if (r.status === 400) {
+          const backoff = Math.floor(SUBMIT_RETRY_DELAY_400_MS * (2 ** attempt));
+          log(`提交 400，${attempt + 1}/${SUBMIT_RETRY_MAX}，${backoff}ms 后重试`, "warn");
+          if (attempt < SUBMIT_RETRY_MAX - 1) {
+            await sleep(backoff);
+            continue;
+          }
+          return null;
+        }
+
+        if (r.status === 429) {
+          const base = SUBMIT_RETRY_DELAY_429_MIN_MS +
+            Math.random() * (SUBMIT_RETRY_DELAY_429_MAX_MS - SUBMIT_RETRY_DELAY_429_MIN_MS);
+          const backoff = Math.floor(base * (2 ** attempt));
+          log(`提交 429 限流，${attempt + 1}/${SUBMIT_RETRY_MAX}，${backoff}ms 后重试`, "warn");
+          if (attempt < SUBMIT_RETRY_MAX - 1) {
+            await sleep(backoff);
+            continue;
+          }
+          return null;
+        }
+
         log(`提交 HTTP ${r.status} (attempt ${attempt + 1})`, "error");
-        if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+        if (attempt < SUBMIT_RETRY_MAX - 1) await sleep(500);
       } catch (e) {
         log(`提交网络错误: ${e.message} (attempt ${attempt + 1})`, "error");
-        if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+        if (attempt < SUBMIT_RETRY_MAX - 1) await sleep(500);
       }
     }
     return null;
@@ -178,7 +222,7 @@
 
   async function checkAndWithdraw() {
     try {
-      const r = await fetch("/balance");
+      const r = await fetch("/balance", { credentials: "include" });
       const d = await r.json();
       const balance = Number(d.pending_balance_micro) || 0;
       if (balance >= WITHDRAW_THRESHOLD_MICRO) {
@@ -186,6 +230,7 @@
         const wr = await fetch("/withdraw_code", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          credentials: "include",
           body: JSON.stringify({}),
         });
         const wd = await wr.json();
@@ -291,10 +336,14 @@
           continue;
         }
 
-        lastSubmittedRoundId = sol.roundId;
-
         try {
           const result = await submitSolution(sol.track, sol.roundId, sol.nonce);
+          if (!result) {
+            log("提交失败，稍后重试", "warn");
+            continue;
+          }
+
+          lastSubmittedRoundId = sol.roundId;
           if (result?.status === "win") {
             const payout = result.payout_micro ? (result.payout_micro / 1e6).toFixed(6) : "?";
             const time = result.solve_time_ms ? (result.solve_time_ms / 1000).toFixed(2) : "?";

@@ -16,6 +16,13 @@ anyhow = "1"
 rand = "0.9"
 wasmtime = "31"
 
+[features]
+cuda = []
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1.0"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
