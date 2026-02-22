@@ -14,7 +14,7 @@
   let WITHDRAW_THRESHOLD_MICRO = 100_000_00;
   const SUBMIT_RETRY_MAX = 3;
   const MIN_SUBMIT_INTERVAL_MS = 1200;
-  const TRACK_DELAY_STEP_MS = 1000;
+  const TRACK_DELAY_STEP_MS = 100;
 
   // ---- 清理旧桥接实例 ----
   if (window.__plbridge) {
