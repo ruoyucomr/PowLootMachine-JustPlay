@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
-use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
+use wasmtime::{Config, Engine, Instance, Memory, Module, OptLevel, Store, TypedFunc};
 
 #[cfg(feature = "cuda")]
 mod gpu;
@@ -570,6 +570,30 @@ struct WasmWorker {
     free_fn: TypedFunc<(i32, i32), ()>,
     vm_chain_verify_fn: TypedFunc<(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32), i32>,
     argon2d_chain_verify_fn: TypedFunc<(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32), i32>,
+    vm_cache: Option<VmCache>,
+    argon_cache: Option<ArgonCache>,
+}
+
+#[derive(Clone)]
+struct CachedBuf {
+    data: Vec<u8>,
+    ptr: i32,
+    len: i32,
+}
+
+struct VmCache {
+    challenge: CachedBuf,
+    seed: CachedBuf,
+    program: CachedBuf,
+    nonce_ptr: i32,
+    nonce_len: i32,
+}
+
+struct ArgonCache {
+    challenge: CachedBuf,
+    seed: CachedBuf,
+    nonce_ptr: i32,
+    nonce_len: i32,
 }
 
 impl WasmWorker {
@@ -588,6 +612,8 @@ impl WasmWorker {
             free_fn,
             vm_chain_verify_fn,
             argon2d_chain_verify_fn,
+            vm_cache: None,
+            argon_cache: None,
         })
     }
 
@@ -599,8 +625,104 @@ impl WasmWorker {
         Ok((ptr, len))
     }
 
+    fn alloc_cached(&mut self, data: &[u8]) -> Result<CachedBuf> {
+        let (ptr, len) = self.alloc(data)?;
+        Ok(CachedBuf {
+            data: data.to_vec(),
+            ptr,
+            len,
+        })
+    }
+
+    fn write_into(&mut self, ptr: i32, data: &[u8]) {
+        let mem_data = self.memory.data_mut(&mut self.store);
+        let start = ptr as usize;
+        let end = start + data.len();
+        mem_data[start..end].copy_from_slice(data);
+    }
+
     fn free_buf(&mut self, ptr: i32, cap: i32) {
         let _ = self.free_fn.call(&mut self.store, (ptr, cap));
+    }
+
+    fn free_cached(&mut self, buf: CachedBuf) {
+        self.free_buf(buf.ptr, buf.len);
+    }
+
+    fn free_vm_cache(&mut self) {
+        if let Some(cache) = self.vm_cache.take() {
+            self.free_buf(cache.nonce_ptr, cache.nonce_len);
+            self.free_cached(cache.program);
+            self.free_cached(cache.seed);
+            self.free_cached(cache.challenge);
+        }
+    }
+
+    fn free_argon_cache(&mut self) {
+        if let Some(cache) = self.argon_cache.take() {
+            self.free_buf(cache.nonce_ptr, cache.nonce_len);
+            self.free_cached(cache.seed);
+            self.free_cached(cache.challenge);
+        }
+    }
+
+    fn ensure_vm_cache(
+        &mut self,
+        challenge: &[u8],
+        seed: &[u8],
+        program: &[u8],
+        nonce_len: i32,
+    ) -> Result<()> {
+        let needs_rebuild = match &self.vm_cache {
+            Some(cache) => {
+                cache.challenge.data != challenge
+                    || cache.seed.data != seed
+                    || cache.program.data != program
+                    || cache.nonce_len != nonce_len
+            }
+            None => true,
+        };
+
+        if needs_rebuild {
+            self.free_vm_cache();
+            let challenge = self.alloc_cached(challenge)?;
+            let seed = self.alloc_cached(seed)?;
+            let program = self.alloc_cached(program)?;
+            let nonce_ptr = self.malloc_fn.call(&mut self.store, nonce_len)?;
+            self.vm_cache = Some(VmCache {
+                challenge,
+                seed,
+                program,
+                nonce_ptr,
+                nonce_len,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_argon_cache(&mut self, challenge: &[u8], seed: &[u8], nonce_len: i32) -> Result<()> {
+        let needs_rebuild = match &self.argon_cache {
+            Some(cache) => {
+                cache.challenge.data != challenge
+                    || cache.seed.data != seed
+                    || cache.nonce_len != nonce_len
+            }
+            None => true,
+        };
+
+        if needs_rebuild {
+            self.free_argon_cache();
+            let challenge = self.alloc_cached(challenge)?;
+            let seed = self.alloc_cached(seed)?;
+            let nonce_ptr = self.malloc_fn.call(&mut self.store, nonce_len)?;
+            self.argon_cache = Some(ArgonCache {
+                challenge,
+                seed,
+                nonce_ptr,
+                nonce_len,
+            });
+        }
+        Ok(())
     }
 
     fn verify_vm_chain(
@@ -615,10 +737,31 @@ impl WasmWorker {
         bits: u32,
         nonce: &[u8],
     ) -> Result<bool> {
-        let (ch_ptr, ch_len) = self.alloc(challenge)?;
-        let (seed_ptr, seed_len) = self.alloc(seed)?;
-        let (prog_ptr, prog_len) = self.alloc(program)?;
-        let (n_ptr, n_len) = self.alloc(nonce)?;
+        let nonce_len = nonce.len() as i32;
+        self.ensure_vm_cache(challenge, seed, program, nonce_len)?;
+        let (
+            ch_ptr,
+            ch_len,
+            seed_ptr,
+            seed_len,
+            prog_ptr,
+            prog_len,
+            n_ptr,
+            n_len,
+        ) = {
+            let cache = self.vm_cache.as_ref().expect("vm cache");
+            (
+                cache.challenge.ptr,
+                cache.challenge.len,
+                cache.seed.ptr,
+                cache.seed.len,
+                cache.program.ptr,
+                cache.program.len,
+                cache.nonce_ptr,
+                cache.nonce_len,
+            )
+        };
+        self.write_into(n_ptr, nonce);
 
         let ok = self.vm_chain_verify_fn.call(
             &mut self.store,
@@ -639,11 +782,6 @@ impl WasmWorker {
             ),
         )?;
 
-        self.free_buf(n_ptr, n_len);
-        self.free_buf(prog_ptr, prog_len);
-        self.free_buf(seed_ptr, seed_len);
-        self.free_buf(ch_ptr, ch_len);
-
         Ok(ok == 1)
     }
 
@@ -657,9 +795,20 @@ impl WasmWorker {
         bits: u32,
         nonce: &[u8],
     ) -> Result<bool> {
-        let (ch_ptr, ch_len) = self.alloc(challenge)?;
-        let (seed_ptr, seed_len) = self.alloc(seed)?;
-        let (n_ptr, n_len) = self.alloc(nonce)?;
+        let nonce_len = nonce.len() as i32;
+        self.ensure_argon_cache(challenge, seed, nonce_len)?;
+        let (ch_ptr, ch_len, seed_ptr, seed_len, n_ptr, n_len) = {
+            let cache = self.argon_cache.as_ref().expect("argon cache");
+            (
+                cache.challenge.ptr,
+                cache.challenge.len,
+                cache.seed.ptr,
+                cache.seed.len,
+                cache.nonce_ptr,
+                cache.nonce_len,
+            )
+        };
+        self.write_into(n_ptr, nonce);
 
         let ok = self.argon2d_chain_verify_fn.call(
             &mut self.store,
@@ -677,11 +826,14 @@ impl WasmWorker {
             ),
         )?;
 
-        self.free_buf(n_ptr, n_len);
-        self.free_buf(seed_ptr, seed_len);
-        self.free_buf(ch_ptr, ch_len);
-
         Ok(ok == 1)
+    }
+}
+
+impl Drop for WasmWorker {
+    fn drop(&mut self) {
+        self.free_vm_cache();
+        self.free_argon_cache();
     }
 }
 
@@ -1864,7 +2016,9 @@ async fn main() -> Result<()> {
     // 初始化 WASM 引擎
     println!("[*] 初始化 WASM 引擎...");
     let wasm_bytes = load_wasm_bytes()?;
-    let engine = Arc::new(Engine::default());
+    let mut wasm_config = Config::new();
+    wasm_config.cranelift_opt_level(OptLevel::Speed);
+    let engine = Arc::new(Engine::new(&wasm_config)?);
     let module = Arc::new(Module::new(&engine, &wasm_bytes)?);
     println!("[*] WASM 模块加载成功 ({} bytes)", wasm_bytes.len());
 
