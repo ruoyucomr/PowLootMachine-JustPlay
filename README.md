@@ -38,12 +38,21 @@ C:\Users\ruoyu\.cargo\bin\cargo.exe build --release --features cuda
 ```
 
 Notes:
-- GPU acceleration is used for `CPU_HASH`, `CHAIN`, `BRANCHY_MIX`, `MEM_WORK`, `TINY_VM`, and `ARGON2D_CHAIN`. `VM_CHAIN` remains WASM/CPU.
-- `--gpu-batch` only affects `ARGON2D_CHAIN`; other tracks use tuned CUDA batch sizes.
-- `--gpu-jobs-per-block` can be used to fix argon2 CUDA jobs-per-block (power of two). Omit to auto-tune.
-- GPU argon2 input assumes `salt = challenge + seed` and `password = nonce` (see `src/main.rs`).
+- GPU acceleration is used for `CPU_HASH`, `CHAIN`, `BRANCHY_MIX`, `MEM_WORK`, and `TINY_VM`.
+- `ARGON2D_CHAIN` and `VM_CHAIN` use WASM/CPU.
+- `--gpu-batch` and `--gpu-jobs-per-block` are currently unused (ARGON2D_CHAIN is forced to WASM/CPU).
 - If the port is in use, start with `--port=<N>` and update `bridge.js`:
   `const RUST_URL = "http://localhost:<N>/";`
+
+### CPU Tuning (Windows)
+By default, the miner reserves CPU cores to reduce system freezes:
+- `>= 8` logical cores: reserve 2 cores
+- `< 8` logical cores: reserve 1 core
+
+Override or tune:
+- `--threads=<N>`: manual thread count
+- `--cpu-priority=<idle|below_normal|normal|above_normal|high|realtime>`
+- `--cpu-affinity=<mask>` (decimal or `0x..`)
 
 ## Browser Bridge
 1. Keep the Rust process running.
