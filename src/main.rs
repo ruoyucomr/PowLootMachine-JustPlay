@@ -1406,43 +1406,13 @@ async fn handle_ws(
                                             #[cfg(feature = "cuda")]
                                             {
                                                 match &track_params {
-                                                    TrackParams::Argon2dChain {
-                                                        challenge,
-                                                        seed,
-                                                        mem_blocks,
-                                                        passes,
-                                                        lanes,
-                                                        bits,
-                                                    } => {
+                                                    TrackParams::Argon2dChain { .. } => {
                                                         println!(
-                                                            "[*] Start mining: track={} round={} bits={} gpu=device{} batch={}",
+                                                            "[*] Start mining: track={} round={} bits={} wasm=on (gpu disabled)",
                                                             track,
                                                             &round_id[..8.min(round_id.len())],
-                                                            bits,
-                                                            config.gpu_device,
-                                                            config.gpu_batch,
+                                                            job_bits,
                                                         );
-                                                        match MiningJob::start_gpu_argon2d(
-                                                            challenge,
-                                                            seed,
-                                                            *bits,
-                                                            *mem_blocks,
-                                                            *passes,
-                                                            *lanes,
-                                                            config.gpu_jobs_per_block,
-                                                            config.gpu_device,
-                                                            config.gpu_batch,
-                                                            &round_id,
-                                                            solution_tx.clone(),
-                                                        ) {
-                                                            Ok(job) => {
-                                                                mining_job = Some(job);
-                                                                started = true;
-                                                            }
-                                                            Err(e) => {
-                                                                eprintln!("[!] GPU init failed: {}", e);
-                                                            }
-                                                        }
                                                     }
                                                     TrackParams::CpuHash { challenge, bits } => {
                                                         match gpu::PowGpuJob::cpu_hash(
