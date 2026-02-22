@@ -14,7 +14,7 @@ futures-util = "0.3"
 num_cpus = "1"
 anyhow = "1"
 rand = "0.9"
-wasmtime = "31"
+wasmtime = { version = "31", features = ["cache"] }
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [features]
