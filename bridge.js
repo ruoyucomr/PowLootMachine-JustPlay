@@ -1,11 +1,11 @@
 // ==============================================================
-// PowLoot Bridge v5 — 浏览器端桥接脚本
+// PowLoot Bridge v6 — 浏览器端桥接脚本
 // 在 powloot-elysiver.h-e.top 控制台粘贴执行
 //
-// v5 改进：
-//   - 提交不阻塞主循环（找到解 → 后台提交 → 立即开始下一题）
-//   - 更好的 HTTP 错误处理和重试
-//   - WS 拦截：send() + constructor（不创建新连接）
+// v6 改进：
+//   - 429 防护：同 round 去重，不限流（偶尔 429 可接受）
+//   - 防竞态：忽略过期 round 的 solution + round_solved 标记已处理
+//   - 429 不重试（重试只会加剧限流）
 // ==============================================================
 (async () => {
   "use strict";
@@ -59,6 +59,8 @@
   let withdrawTimer = null;
   // 找到解时暂存，供主循环提交
   let lastSolution = null;
+  // 429 防护：去重（不限流，偶尔 429 可接受）
+  let lastSubmittedRoundId = null;  // 已提交过的 round_id
 
   function resolvePending() {
     if (pendingResolve) { const fn = pendingResolve; pendingResolve = null; fn(); }
@@ -78,8 +80,9 @@
       }
       if (msg?.type === "round_solved") {
         if (running && currentTrack === msg.track && currentRoundId === msg.round_id) {
-          log(`本轮已被他人解出 (${msg.track})，切换下一题...`, "warn");
+          log(`本轮已被他人解出 (${msg.track} round ${msg.round_id})，切换下一题...`, "warn");
           lastSolution = null; // 不要提交了
+          lastSubmittedRoundId = msg.round_id; // 标记此 round 已处理，防止后到的 solution 再提交
           sendToRust({ type: "stop" });
           resolvePending();
         }
@@ -157,12 +160,17 @@
           const ct = r.headers.get("content-type") || "";
           if (ct.includes("json")) return r.json();
         }
-        // 非 200 或非 JSON — 可能是 Cloudflare 拦截
+        // 429 = 限流，不要重试（重试只会更糟）
+        if (r.status === 429) {
+          log(`提交 429 限流，跳过`, "warn");
+          return null;
+        }
+        // 其他非 200 — 可能是 Cloudflare 拦截，可重试一次
         log(`提交 HTTP ${r.status} (attempt ${attempt + 1})`, "error");
-        if (attempt === 0) await new Promise(r => setTimeout(r, 300));
+        if (attempt === 0) await new Promise(r => setTimeout(r, 500));
       } catch (e) {
         log(`提交网络错误: ${e.message} (attempt ${attempt + 1})`, "error");
-        if (attempt === 0) await new Promise(r => setTimeout(r, 300));
+        if (attempt === 0) await new Promise(r => setTimeout(r, 500));
       }
     }
     return null;
@@ -203,7 +211,12 @@
         updateRustBtn();
         break;
       case "solution":
-        // 暂存解，不在这里提交（主循环负责提交）
+        // 防竞态：round_id 不匹配当前轮或已提交过 → 静默忽略
+        if (data.round_id && data.round_id != currentRoundId) break;
+        if (currentRoundId != null && currentRoundId === lastSubmittedRoundId) {
+          resolvePending();
+          break;
+        }
         log(`找到解! nonce=${data.nonce.slice(0, 16)}...`, "success");
         lastSolution = { nonce: data.nonce, track: currentTrack, roundId: currentRoundId };
         resolvePending();
@@ -240,6 +253,13 @@
       }
 
       const { track, round_id, params } = challenge;
+
+      // 如果服务器还没切换 round（返回了已提交过的 round），短暂等待后重新拉取
+      if (round_id === lastSubmittedRoundId) {
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
+
       currentTrack = track;
       currentRoundId = round_id;
       lastSolution = null;
@@ -260,10 +280,19 @@
         setTimeout(() => { if (pendingResolve === resolve) { pendingResolve = null; resolve(); } }, 300_000);
       });
 
-      // 如果找到了解 → 提交并等待结果（避免 429 限流）
+      // 如果找到了解 → 去重后提交
       if (lastSolution) {
         const sol = lastSolution;
         lastSolution = null;
+
+        // 去重：已提交过此 round 则跳过
+        if (sol.roundId === lastSubmittedRoundId) {
+          log(`跳过重复提交 (round ${sol.roundId})`, "warn");
+          continue;
+        }
+
+        lastSubmittedRoundId = sol.roundId;
+
         try {
           const result = await submitSolution(sol.track, sol.roundId, sol.nonce);
           if (result?.status === "win") {
@@ -291,6 +320,7 @@
     running = false;
     if (sendMsg) sendToRust({ type: "stop" });
     lastSolution = null;
+    lastSubmittedRoundId = null;
     resolvePending();
     currentTrack = null;
     currentRoundId = null;
@@ -388,6 +418,6 @@
     _OrigWS,
   };
 
-  log("Bridge v5 已加载", "success");
+  log("Bridge v6 已加载", "success");
   log("提示：如 secret 未获取，请先点一下页面「开始计算」再停止即可触发", "warn");
 })();
