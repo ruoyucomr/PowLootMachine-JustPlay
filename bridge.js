@@ -52,6 +52,15 @@
   }
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  function getRetryAfterMs(resp) {
+    const ra = resp.headers.get("Retry-After");
+    if (!ra) return null;
+    const seconds = Number(ra);
+    if (!Number.isNaN(seconds)) return Math.max(0, Math.floor(seconds * 1000));
+    const dateMs = Date.parse(ra);
+    if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+    return null;
+  }
   let lastSubmitAt = 0;
 
   // ---- 状态 ----
@@ -199,9 +208,10 @@
         }
 
         if (r.status === 429) {
+          const raMs = getRetryAfterMs(r);
           const base = SUBMIT_RETRY_DELAY_429_MIN_MS +
             Math.random() * (SUBMIT_RETRY_DELAY_429_MAX_MS - SUBMIT_RETRY_DELAY_429_MIN_MS);
-          const backoff = Math.floor(base * (2 ** attempt));
+          const backoff = Math.floor((raMs !== null ? raMs : base * (2 ** attempt)) + Math.random() * 200);
           log(`提交 429 限流，${attempt + 1}/${SUBMIT_RETRY_MAX}，${backoff}ms 后重试`, "warn");
           if (attempt < SUBMIT_RETRY_MAX - 1) {
             await sleep(backoff);
