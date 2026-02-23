@@ -14,13 +14,18 @@
   let WITHDRAW_THRESHOLD_MICRO = 100_000_00;
   const SUBMIT_RETRY_MAX = 3;
   const MIN_SUBMIT_INTERVAL_MS = 1200;
-  const TRACK_DELAY_STEP_MS = 100;
+  const TRACK_DELAY_STEP_MS = 0;
+  let AUTO_CYCLE_ENABLED = true;
+  const AUTO_CYCLE_INTERVAL_MS = 20 * 60 * 1000;
+  const AUTO_CYCLE_RUN_MS = 10 * 1000;
 
   // ---- 清理旧桥接实例 ----
   if (window.__plbridge) {
     if (window.__plbridge._relayWin) try { window.__plbridge._relayWin.close(); } catch {}
     if (window.__plbridge._onMessage) window.removeEventListener("message", window.__plbridge._onMessage);
     if (window.__plbridge._withdrawTimer) clearInterval(window.__plbridge._withdrawTimer);
+    if (window.__plbridge._cycleTimer) clearInterval(window.__plbridge._cycleTimer);
+    if (window.__plbridge._cycleStopTimer) clearTimeout(window.__plbridge._cycleStopTimer);
     if (window.__plbridge._stop) window.__plbridge._stop(false);
     if (window.__plbridge._origSend) WebSocket.prototype.send = window.__plbridge._origSend;
     if (window.__plbridge._OrigWS) window.WebSocket = window.__plbridge._OrigWS;
@@ -60,6 +65,8 @@
     return null;
   }
   let lastSubmitAt = 0;
+  let autoCycleTimer = null;
+  let autoCycleStopTimer = null;
   const submitDelayByTrack = new Map();
   function getTrackDelay(track) {
     return submitDelayByTrack.get(track) || 0;
@@ -431,6 +438,23 @@
     }
   }
 
+  function triggerAutoCycle() {
+    if (!AUTO_CYCLE_ENABLED) return;
+    if (!isRustConnected()) return;
+    if (running) return;
+    bridgeStart();
+    if (autoCycleStopTimer) clearTimeout(autoCycleStopTimer);
+    autoCycleStopTimer = setTimeout(() => {
+      if (running) bridgeStop(true);
+    }, AUTO_CYCLE_RUN_MS);
+  }
+
+  function startAutoCycle() {
+    if (!AUTO_CYCLE_ENABLED) return;
+    if (autoCycleTimer) clearInterval(autoCycleTimer);
+    autoCycleTimer = setInterval(triggerAutoCycle, AUTO_CYCLE_INTERVAL_MS);
+  }
+
   // ---- 中继消息 ----
   function onRelayMessage(event) {
     if (!event.data || event.data._r !== 1) return;
@@ -477,14 +501,21 @@
     }),
     withdraw: checkAndWithdraw,
     setThreshold: (micro) => { WITHDRAW_THRESHOLD_MICRO = micro; log(`提现阈值: ${micro} micro`); },
+    setAutoCycle: (enabled) => {
+      AUTO_CYCLE_ENABLED = !!enabled;
+      if (AUTO_CYCLE_ENABLED) startAutoCycle();
+    },
     _relayWin: relayWin,
     _onMessage: onRelayMessage,
     _stop: bridgeStop,
     _withdrawTimer: null,
+    _cycleTimer: null,
+    _cycleStopTimer: null,
     _origSend,
     _OrigWS,
   };
 
   log("Bridge v6 已加载", "success");
   log("提示：如 secret 未获取，请先点一下页面「开始计算」再停止即可触发", "warn");
+  startAutoCycle();
 })();
